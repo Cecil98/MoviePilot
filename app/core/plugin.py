@@ -55,6 +55,9 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         self._stop_monitor_event = threading.Event()
         # 本地插件同步写入运行目录后的短时忽略窗口
         self._recent_local_sync: Dict[str, float] = {}
+        # 插件智能体工具注册表缓存，插件启停或配置生效时主动失效。
+        self._plugin_agent_tools_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._plugin_agent_tools_cache_lock = threading.Lock()
         # 开发者模式监测插件修改
         if settings.DEV or settings.PLUGIN_AUTO_RELOAD:
             self.__start_monitor()
@@ -112,6 +115,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                     eventmanager.disable_event_handler(plugin)
             except Exception as err:
                 logger.error(f"加载插件 {plugin_id} 出错：{str(err)} - {traceback.format_exc()}")
+        self.clear_plugin_agent_tools_cache()
 
     def init_plugin(self, plugin_id: str, conf: dict):
         """
@@ -131,6 +135,14 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         else:
             # 禁用插件类的事件处理器
             eventmanager.disable_event_handler(type(plugin))
+        self.clear_plugin_agent_tools_cache()
+
+    def clear_plugin_agent_tools_cache(self) -> None:
+        """
+        清空插件智能体工具注册表缓存。
+        """
+        with self._plugin_agent_tools_cache_lock:
+            self._plugin_agent_tools_cache.clear()
 
     def stop(self, pid: Optional[str] = None):
         """
@@ -167,6 +179,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
             self._running_plugins = {}
             # 清除所有插件模块缓存
             self._clear_plugin_modules()
+        self.clear_plugin_agent_tools_cache()
         logger.info("插件停止完成")
 
     @staticmethod
@@ -466,7 +479,8 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                     pid=plugin_dir_name,
                     package_version=package_version,
                     repo_path=local_repo_path,
-                    strict_compat=False
+                    strict_compat=False,
+                    strict_system_version=not settings.DEV
                 )
                 if candidate:
                     return candidate
@@ -487,6 +501,9 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
 
         candidate = candidate or PluginHelper().get_local_plugin_candidate(pid)
         if not candidate:
+            return False
+        if candidate.get("compatible") is False:
+            logger.info(f"本地插件 {pid} 不满足同步条件，跳过自动同步：{candidate.get('skip_reason')}")
             return False
 
         source_dir = Path(candidate.get("path"))
@@ -878,6 +895,21 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                     logger.error(f"获取插件 {plugin_id} 动作出错：{str(e)}")
         return ret_actions
 
+    @staticmethod
+    def _copy_plugin_agent_tools(
+        tools_info: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        复制插件智能体工具注册信息，避免调用方修改缓存内容。
+        """
+        return [
+            {
+                **plugin_info,
+                "tools": list(plugin_info.get("tools", [])),
+            }
+            for plugin_info in tools_info
+        ]
+
     def get_plugin_agent_tools(self, pid: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         获取插件智能体工具
@@ -887,6 +919,12 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
             "tools": [ToolClass1, ToolClass2, ...]
         }]
         """
+        cache_key = pid or "__all__"
+        with self._plugin_agent_tools_cache_lock:
+            cached_tools = self._plugin_agent_tools_cache.get(cache_key)
+        if cached_tools is not None:
+            return self._copy_plugin_agent_tools(cached_tools)
+
         ret_tools = []
         # 创建字典快照避免并发修改
         running_plugins_snapshot = dict(self._running_plugins)
@@ -906,6 +944,10 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                         })
                 except Exception as e:
                     logger.error(f"获取插件 {plugin_id} 智能体工具出错：{str(e)}")
+        with self._plugin_agent_tools_cache_lock:
+            self._plugin_agent_tools_cache[cache_key] = self._copy_plugin_agent_tools(
+                ret_tools
+            )
         return ret_tools
 
     @staticmethod
@@ -1080,7 +1122,7 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
                 logger.error(f"获取插件[{plugin_id}]仪表盘元数据出错：{str(e)}")
         return dashboard_meta
 
-    def get_plugin_dashboard(self, pid: str, key: str, user_agent: str = None) -> schemas.PluginDashboard:
+    def get_plugin_dashboard(self, pid: str, key: str, user_agent: str = None) -> Optional[schemas.PluginDashboard]:
         """
         获取插件仪表盘
         """
@@ -1113,6 +1155,12 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
             logger.error(f"插件 {pid} 调用方法 get_dashboard 出错: {str(e)}")
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 detail=f"插件 {pid} 调用方法 get_dashboard 出错: {str(e)}")
+        if dashboard is None:
+            return None
+        if not isinstance(dashboard, (tuple, list)) or len(dashboard) != 3:
+            logger.error(f"插件 {pid} 返回的仪表盘数据格式错误")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"插件 {pid} 返回的仪表盘数据格式错误")
         cols, attrs, elements = dashboard
         return schemas.PluginDashboard(
             id=pid,
@@ -1298,6 +1346,20 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         # 根据加载排序重新排序
         plugins.sort(key=lambda x: x.plugin_order if hasattr(x, "plugin_order") else 0)
         return plugins
+
+    def get_local_plugin_version(self, pid: str) -> Optional[str]:
+        """
+        获取指定已安装插件的本地版本，不触发全部插件的状态、页面和权限计算。
+
+        插件类由运行期动态加载，旧插件可能未声明版本属性，因此缺失时返回 None。
+        """
+        installed_apps = SystemConfigOper().get(SystemConfigKey.UserInstalledPlugins) or []
+        if pid not in installed_apps:
+            return None
+        plugin_class = self._plugins.get(pid)
+        if not plugin_class:
+            return None
+        return getattr(plugin_class, "plugin_version", None)
 
     def get_local_repo_plugins(self) -> List[schemas.Plugin]:
         """
@@ -1528,14 +1590,15 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         if plugin_info.get("icon"):
             plugin.plugin_icon = plugin_info.get("icon")
         # 标签
-        if plugin_info.get("labels"):
-            plugin.plugin_label = plugin_info.get("labels")
+        plugin.plugin_label = self._normalize_plugin_label(plugin_info.get("labels"))
         # 作者
         if plugin_info.get("author"):
             plugin.plugin_author = plugin_info.get("author")
         # 更新历史
         if plugin_info.get("history"):
             plugin.history = plugin_info.get("history")
+        # Release 能力位来自插件市场索引，用于前端展示和后端安装入口双重校验。
+        plugin.release = bool(plugin_info.get("release"))
         # 仓库链接
         plugin.repo_url = market
         # 本地标志
@@ -1544,6 +1607,22 @@ class PluginManager(ConfigReloadMixin, metaclass=Singleton):
         plugin.add_time = add_time
 
         return plugin
+
+    @staticmethod
+    def _normalize_plugin_label(labels: Any) -> Optional[str]:
+        """
+        规整插件市场标签字段，兼容旧字符串和新列表格式。
+
+        :param labels: 插件市场 package 中的 labels 字段
+        :return: 用空格拼接后的标签字符串，无法识别或为空时返回 None
+        """
+        if isinstance(labels, str):
+            label = labels.strip()
+            return label or None
+        if isinstance(labels, list):
+            normalized_labels = [str(item).strip() for item in labels if str(item).strip()]
+            return " ".join(normalized_labels) or None
+        return None
 
     async def async_get_online_plugins(self, force: bool = False) -> List[schemas.Plugin]:
         """

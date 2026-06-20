@@ -114,6 +114,7 @@ MoviePilot 也提供普通 REST API 给前端和自动化客户端使用。所�
 | :--- | :--- | :--- |
 | GET | `/api/v1/system/ping` | 登录用户服务存活检测，用于前端重启后轮询恢复状态 |
 | GET | `/api/v1/system/setting/public/{key}` | 登录用户读取白名单内非敏感系统设置，仅支持目录、存储、站点范围、默认订阅规则、Follow 订阅者和插件市场地址等前端必需配置 |
+| POST | `/api/v1/system/setting/PLUGIN_MARKET/sync-wiki` | 管理员从 MoviePilot Wiki 的插件文档同步公开插件仓库清单，和本地 `PLUGIN_MARKET` 合并去重后写入配置 |
 
 ### 插件补充接口
 
@@ -220,6 +221,27 @@ MoviePilot 也提供普通 REST API 给前端和自动化客户端使用。所�
 ```
 
 `browse_webpage` 使用持久浏览器会话，默认以当前 Agent 会话作为 `session_key`。`goto`、`snapshot`、`click`、`click_ref`、`fill`、`fill_ref`、`select`、`select_ref`、`wait` 等动作会返回页面快照，快照中的 `interactive_elements[].ref` 可用于后续 `*_ref` 操作。支持 `list_tabs`、`open_tab`、`focus_tab`、`close_tab` 管理标签页，支持 `close_session` 释放会话。出于安全考虑，默认拒绝访问 localhost、环回地址、私网地址和链路本地地址；确需访问可信内网或本机页面时，可显式传入 `allow_private_network: true`。
+
+**`recognize_captcha` 图形验证码识别示例**:
+```json
+{
+  "tool_name": "recognize_captcha",
+  "arguments": {
+    "image_url": "https://example.com/captcha.png",
+    "cookie": "sid=...",
+    "user_agent": "Mozilla/5.0 ..."
+  }
+}
+```
+
+`recognize_captcha` 用于浏览器自动化登录时识别普通图形验证码。智能体可先通过 `browse_webpage` 的 `evaluate` 动作从页面元素中提取 `img.src`，再把图片地址传给该工具；支持 `http/https` 图片地址和 `data:image/...;base64,...`。当验证码图片依赖当前浏览器会话时，可传入 Cookie 与 User-Agent。出于安全考虑，默认拒绝访问 localhost、环回地址、私网地址和链路本地地址；确需访问可信内网或本机验证码图片时，可显式传入 `allow_private_network: true`。
+
+**下载任务工具说明**：
+
+- `add_download_tasks` 用于添加下载任务，支持 `get_search_results` 返回的 `hash:id` 引用和磁力链接，可指定下载器、保存目录和标签。
+- `query_download_tasks` 用于查询下载任务，支持按下载器、状态、Hash、标题、标签过滤；返回保存目录、内容路径、上传/下载速度、上传/下载限速、分类、分享率、做种时间等下载器可提供的字段。按 `hash` 查询或传入 `include_trackers=true` 时，会尽量返回 Tracker URL 列表。
+- `update_download_tasks` 用于修改下载任务，统一支持 `start`/`stop`、标签、上传/下载限速、Tracker、保存目录、分类、分享率、做种时间等字段；具体字段是否成功取决于下载器能力，返回结果会按操作项逐条标记成功或失败。
+- `delete_download_tasks` 用于删除下载任务，按任务 Hash 操作，可指定下载器，并可选择是否同时删除已下载文件。
 
 ### 3. 获取工具详情
 

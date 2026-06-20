@@ -5,7 +5,7 @@ from typing import Optional, Type
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.agent.tools.base import MoviePilotTool, ToolChain
+from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
 from app.log import logger
 from app.schemas import Notification, NotificationType
@@ -55,7 +55,7 @@ class SendLocalFileTool(MoviePilotTool):
         "Use this when you have generated or identified a local file the user should download."
     )
     args_schema: Type[BaseModel] = SendLocalFileInput
-    require_admin: bool = False
+    require_admin: bool = True
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         file_path = kwargs.get("file_path", "")
@@ -96,7 +96,7 @@ class SendLocalFileTool(MoviePilotTool):
             resolved_path,
         )
 
-        await ToolChain().async_post_message(
+        await self.send_notification_message(
             Notification(
                 channel=channel,
                 source=self._source,

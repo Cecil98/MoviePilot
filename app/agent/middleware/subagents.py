@@ -24,6 +24,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
 from app.agent.middleware.utils import append_to_system_message
+from app.agent.runtime import SubAgentDefinition, agent_runtime_manager
 from app.agent.tools.tags import ToolTag
 from app.log import logger
 
@@ -38,6 +39,7 @@ SUBAGENT_MAX_ACTIVE_TASKS = 8
 SUBAGENT_MAX_CONCURRENT_TASKS = 4
 SUBAGENT_RESULT_MAX_CHARS = 12000
 SUBAGENT_DESCRIPTION_MAX_CHARS = 500
+SUBAGENT_PIPELINE_CONTEXT_MAX_CHARS = 12000
 
 SUBAGENT_PARENT_PROMPT = """<subagents>
 You may use subagent tools to delegate independent research, retrieval,
@@ -50,6 +52,9 @@ Delegation modes:
   `action=wait`, or `action=cancel` with the returned task IDs.
 - Use `subagent_task` with `action=run` when you want to launch a bounded
   batch and wait for the batch in one tool call.
+- Use `subagent_task` with `action=pipeline` when later subtasks must use
+  previous subagent results. Pipeline steps run sequentially, and each step's
+  result is passed as private context to the next step.
 
 Rules:
 - Delegate when a task benefits from focused investigation, such as media identity checks, site/resource search, subscription analysis, download/transfer diagnosis, MoviePilot code/config exploration, or read-only system inspection.
@@ -70,7 +75,9 @@ SUBAGENT_CONTROL_DESCRIPTION = (
     "Use action=start with tasks=[{description, subagent_type}] to launch a batch "
     "and get task IDs immediately. Use action=status to inspect tasks, action=wait "
     "to wait for all or any task result, action=cancel to stop running tasks, and "
-    "action=run to launch a bounded batch and wait in one call."
+    "action=run to launch a bounded batch and wait in one call. Use action=pipeline "
+    "to run tasks sequentially while passing each result as private context to the "
+    "next task."
 )
 
 SUBAGENT_BASE_PROMPT = """You are a silent subagent working for the MoviePilot main agent.
@@ -87,7 +94,7 @@ Requirements:
 
 @dataclass(frozen=True)
 class _SubAgentProfile:
-    """内置子代理定义。"""
+    """子代理运行时定义。"""
 
     name: str
     description: str
@@ -119,9 +126,9 @@ class _SubAgentTaskSpec(BaseModel):
 class _SubAgentControlInput(BaseModel):
     """异步子代理管控工具输入。"""
 
-    action: Literal["start", "status", "wait", "cancel", "run"] = Field(
+    action: Literal["start", "status", "wait", "cancel", "run", "pipeline"] = Field(
         default="start",
-        description="Task action: start, status, wait, cancel, or run.",
+        description="Task action: start, status, wait, cancel, run, or pipeline.",
     )
     description: Optional[str] = Field(
         default=None,
@@ -149,7 +156,10 @@ class _SubAgentControlInput(BaseModel):
     )
     timeout_ms: Optional[int] = Field(
         default=SUBAGENT_DEFAULT_WAIT_TIMEOUT_MS,
-        description="Maximum wait time in milliseconds for action=wait or action=run.",
+        description=(
+            "Maximum wait time in milliseconds for action=wait, action=run, "
+            "or each action=pipeline step."
+        ),
     )
 
 
@@ -197,40 +207,15 @@ def builtin_subagent_names() -> frozenset[str]:
 
 @lru_cache(maxsize=1)
 def _builtin_subagent_profiles() -> tuple[_SubAgentProfile, ...]:
-    """构建 MoviePilot 默认内置子代理定义。"""
-    default_exclude_tags = frozenset(
-        {
-            ToolTag.Write.value,
-            ToolTag.Message.value,
-            ToolTag.UserInteraction.value,
-        }
+    """从运行时配置目录加载 MoviePilot 子代理定义。"""
+    definitions = agent_runtime_manager.list_subagents()
+    profiles = tuple(
+        _profile_from_runtime_definition(definition)
+        for definition in definitions
     )
-    general_tags = frozenset(
-        {
-            ToolTag.Media.value,
-            ToolTag.Resource.value,
-            ToolTag.Site.value,
-            ToolTag.Subscription.value,
-            ToolTag.Download.value,
-            ToolTag.Library.value,
-            ToolTag.Transfer.value,
-            ToolTag.System.value,
-            ToolTag.Settings.value,
-            ToolTag.Plugin.value,
-            ToolTag.Workflow.value,
-            ToolTag.Scheduler.value,
-            ToolTag.File.value,
-            ToolTag.Directory.value,
-            ToolTag.Web.value,
-            ToolTag.Command.value,
-            ToolTag.FilterRule.value,
-            ToolTag.Persona.value,
-            ToolTag.SlashCommand.value,
-            ToolTag.Recommendation.value,
-            ToolTag.Metadata.value,
-        }
-    )
-
+    if profiles:
+        return profiles
+    logger.warning("未加载到任何子代理定义，使用通用兜底子代理。")
     return (
         _SubAgentProfile(
             name="general-purpose",
@@ -239,123 +224,31 @@ def _builtin_subagent_profiles() -> tuple[_SubAgentProfile, ...]:
                 f"{SUBAGENT_BASE_PROMPT}\n"
                 "You specialize in synthesizing media, site, subscription, download, and system status signals."
             ),
-            include_tags=general_tags,
-            exclude_tags=default_exclude_tags,
-        ),
-        _SubAgentProfile(
-            name="media-researcher",
-            description="Media research subagent for title recognition, people, episodes, metadata, and library existence checks.",
-            prompt=(
-                f"{SUBAGENT_BASE_PROMPT}\n"
-                "You specialize in media identity resolution, metadata validation, person credits, and library status analysis."
-            ),
-            include_tags=frozenset(
+            include_tags=frozenset(tag.value for tag in ToolTag),
+            exclude_tags=frozenset(
                 {
-                    ToolTag.Media.value,
-                    ToolTag.Library.value,
-                    ToolTag.Recommendation.value,
-                    ToolTag.Metadata.value,
-                    ToolTag.Web.value,
+                    ToolTag.Write.value,
+                    ToolTag.Message.value,
+                    ToolTag.UserInteraction.value,
                 }
             ),
-            exclude_tags=default_exclude_tags,
         ),
-        _SubAgentProfile(
-            name="moviepilot-explorer",
-            description="MoviePilot exploration subagent for source-code inspection, configuration structure analysis, logs, and code-level troubleshooting clues.",
-            prompt=(
-                f"{SUBAGENT_BASE_PROMPT}\n"
-                "You specialize in MoviePilot source-code structure, local configuration files, directory layout, logs or read-only command output, and code-level root-cause troubleshooting. "
-                "Prefer reading relevant code paths before judging behavior, and distinguish code/config evidence from runtime system state."
-            ),
-            include_tags=frozenset(
-                {
-                    ToolTag.System.value,
-                    ToolTag.Settings.value,
-                    ToolTag.File.value,
-                    ToolTag.Directory.value,
-                    ToolTag.Command.value,
-                }
-            ),
-            exclude_tags=default_exclude_tags,
-        ),
-        _SubAgentProfile(
-            name="resource-searcher",
-            description="Site and resource search subagent for site checks, torrent search, and resource quality analysis.",
-            prompt=(
-                f"{SUBAGENT_BASE_PROMPT}\n"
-                "You specialize in site status, site user data, torrent search results, and resource quality judgment."
-            ),
-            include_tags=frozenset(
-                {
-                    ToolTag.Resource.value,
-                    ToolTag.Site.value,
-                    ToolTag.Web.value,
-                    ToolTag.Media.value,
-                }
-            ),
-            exclude_tags=default_exclude_tags,
-        ),
-        _SubAgentProfile(
-            name="subscription-analyst",
-            description="Subscription analysis subagent for subscriptions, history, filter rules, and custom identifiers.",
-            prompt=(
-                f"{SUBAGENT_BASE_PROMPT}\n"
-                "You specialize in current subscription state, subscription history, filter rules, and subscription optimization suggestions."
-            ),
-            include_tags=frozenset(
-                {
-                    ToolTag.Subscription.value,
-                    ToolTag.FilterRule.value,
-                    ToolTag.Settings.value,
-                    ToolTag.Media.value,
-                }
-            ),
-            exclude_tags=default_exclude_tags,
-        ),
-        _SubAgentProfile(
-            name="system-diagnostician",
-            description="System diagnosis subagent for read-only inspection of settings, schedulers, workflows, plugins, directories, and command output.",
-            prompt=(
-                f"{SUBAGENT_BASE_PROMPT}\n"
-                "You specialize in settings, plugins, scheduled tasks, workflows, directories, and read-only command diagnostics."
-            ),
-            include_tags=frozenset(
-                {
-                    ToolTag.System.value,
-                    ToolTag.Settings.value,
-                    ToolTag.Plugin.value,
-                    ToolTag.Workflow.value,
-                    ToolTag.Scheduler.value,
-                    ToolTag.File.value,
-                    ToolTag.Directory.value,
-                    ToolTag.Web.value,
-                    ToolTag.Command.value,
-                    ToolTag.Persona.value,
-                    ToolTag.SlashCommand.value,
-                }
-            ),
-            exclude_tags=default_exclude_tags,
-        ),
-        _SubAgentProfile(
-            name="download-diagnostician",
-            description="Download and transfer diagnosis subagent for downloaders, download tasks, transfer history, and library status.",
-            prompt=(
-                f"{SUBAGENT_BASE_PROMPT}\n"
-                "You specialize in downloaders, download tasks, transfer history, directory settings, and library ingestion state."
-            ),
-            include_tags=frozenset(
-                {
-                    ToolTag.Download.value,
-                    ToolTag.Transfer.value,
-                    ToolTag.Library.value,
-                    ToolTag.Directory.value,
-                    ToolTag.File.value,
-                    ToolTag.Media.value,
-                }
-            ),
-            exclude_tags=default_exclude_tags,
-        ),
+    )
+
+
+def _profile_from_runtime_definition(
+    definition: SubAgentDefinition,
+) -> _SubAgentProfile:
+    """把运行时子代理定义转换为中间件可用的 profile。"""
+    prompt_parts = [SUBAGENT_BASE_PROMPT]
+    if definition.text.strip():
+        prompt_parts.append(definition.text.strip())
+    return _SubAgentProfile(
+        name=definition.subagent_id,
+        description=definition.description,
+        prompt="\n".join(prompt_parts),
+        include_tags=frozenset(definition.include_tags),
+        exclude_tags=frozenset(definition.exclude_tags),
     )
 
 
@@ -858,7 +751,8 @@ class SubAgentTaskControlMiddleware(AgentMiddleware):
             f"pending={len(pending_tasks) - finished_count}"
         )
 
-    async def _cancel_records(self, records: list[_SubAgentRuntimeTask]) -> None:
+    @staticmethod
+    async def _cancel_records(records: list[_SubAgentRuntimeTask]) -> None:
         """取消一组尚未完成的任务。"""
         cancellable_tasks = [
             record.task for record in records if not record.task.done()
@@ -870,6 +764,156 @@ class SubAgentTaskControlMiddleware(AgentMiddleware):
         if cancellable_tasks:
             await asyncio.gather(*cancellable_tasks, return_exceptions=True)
             logger.info(f"子代理任务取消完成: tasks={len(cancellable_tasks)}")
+
+    @staticmethod
+    def _pipeline_description(
+        *,
+        description: str,
+        previous_results: list[tuple[_SubAgentRuntimeTask, str]],
+    ) -> str:
+        """追加上游子代理结果，生成当前管道步骤的任务描述。"""
+        normalized_description = description.strip()
+        if not previous_results:
+            return normalized_description
+
+        context_parts = []
+        for step_index, (record, result) in enumerate(previous_results, start=1):
+            clipped_result, result_truncated = _clip_text(
+                result,
+                SUBAGENT_RESULT_MAX_CHARS,
+            )
+            truncated_note = "\n[Result truncated]" if result_truncated else ""
+            context_parts.append(
+                f"Step {step_index} ({record.subagent_type}) result:\n"
+                f"{clipped_result}{truncated_note}"
+            )
+        context_text, context_truncated = _clip_text(
+            "\n\n".join(context_parts),
+            SUBAGENT_PIPELINE_CONTEXT_MAX_CHARS,
+        )
+        truncated_note = "\n[Pipeline context truncated]" if context_truncated else ""
+        return (
+            f"{normalized_description}\n\n"
+            "<pipeline_context>\n"
+            "Previous subagent results are private context for this delegated "
+            "subtask. Use them to complete the current task, but do not expose "
+            "the prior reports verbatim.\n\n"
+            f"{context_text}{truncated_note}\n"
+            "</pipeline_context>"
+        )
+
+    async def _execute_pipeline_task(
+        self,
+        *,
+        record: _SubAgentRuntimeTask,
+        description: str,
+    ) -> str:
+        """执行单个管道步骤，保留原始步骤描述用于状态展示。"""
+        async with self._semaphore:
+            record.started_at = datetime.now()
+            logger.info(
+                f"管道子代理任务开始执行: task_id={record.task_id}, "
+                f"subagent_type={record.subagent_type}"
+            )
+            try:
+                result = await self._provider.run_task(
+                    description=description,
+                    subagent_type=record.subagent_type,
+                    task_id=record.task_id,
+                )
+                logger.info(
+                    f"管道子代理任务执行完成: task_id={record.task_id}, "
+                    f"subagent_type={record.subagent_type}, result_chars={len(result)}"
+                )
+                return result
+            except asyncio.CancelledError:
+                logger.info(
+                    f"管道子代理任务已取消: task_id={record.task_id}, "
+                    f"subagent_type={record.subagent_type}"
+                )
+                raise
+            except Exception as err:
+                logger.error(f"管道子代理任务执行失败: task_id={record.task_id}, error={err}")
+                raise
+
+    @staticmethod
+    def _create_pipeline_record(
+            spec: _SubAgentTaskSpec,
+    ) -> _SubAgentRuntimeTask:
+        """创建一个管道步骤记录。"""
+        task_id = f"subagent-{uuid.uuid4().hex[:12]}"
+        return _SubAgentRuntimeTask(
+            task_id=task_id,
+            description=spec.description.strip(),
+            subagent_type=spec.subagent_type or "general-purpose",
+            task=None,
+            created_at=datetime.now(),
+        )
+
+    def _track_pipeline_task(
+        self,
+        record: _SubAgentRuntimeTask,
+        task: asyncio.Task,
+    ) -> None:
+        """登记管道步骤任务，复用统一的状态和异常收口逻辑。"""
+        record.task = task
+        task.add_done_callback(
+            lambda finished_task, finished_task_id=record.task_id: self._mark_task_finished(
+                finished_task_id,
+                finished_task,
+            )
+        )
+        self._tasks[record.task_id] = record
+
+    async def _run_pipeline(
+        self,
+        specs: list[_SubAgentTaskSpec],
+        timeout_ms: Optional[int],
+    ) -> tuple[list[_SubAgentRuntimeTask], Optional[str]]:
+        """按顺序执行管道任务，并把每一步结果传给下一步。"""
+        normalized_timeout_ms = self._normalize_timeout_ms(timeout_ms)
+        if normalized_timeout_ms <= 0:
+            return [], "管道任务需要大于 0 的等待时间。"
+
+        records: list[_SubAgentRuntimeTask] = []
+        previous_results: list[tuple[_SubAgentRuntimeTask, str]] = []
+        timeout = normalized_timeout_ms / 1000
+        for step_index, spec in enumerate(specs, start=1):
+            record = self._create_pipeline_record(spec)
+            records.append(record)
+            pipeline_description = self._pipeline_description(
+                description=record.description,
+                previous_results=previous_results,
+            )
+            task = asyncio.create_task(
+                self._execute_pipeline_task(
+                    record=record,
+                    description=pipeline_description,
+                ),
+                name=record.task_id,
+            )
+            self._track_pipeline_task(record, task)
+            logger.info(
+                f"已启动管道子代理任务: step={step_index}, task_id={record.task_id}, "
+                f"subagent_type={record.subagent_type}"
+            )
+
+            try:
+                result = await asyncio.wait_for(task, timeout=timeout)
+            except asyncio.TimeoutError:
+                error = f"第 {step_index} 个管道子代理任务等待超时。"
+                logger.info(
+                    f"{error} task_id={record.task_id}, timeout_ms={normalized_timeout_ms}"
+                )
+                return records, error
+            except Exception as err:
+                error = f"第 {step_index} 个管道子代理任务执行失败: {err}"
+                logger.info(f"{error} task_id={record.task_id}")
+                return records, error
+
+            previous_results.append((record, result))
+
+        return records, None
 
     async def _control_task(
         self,
@@ -884,7 +928,7 @@ class SubAgentTaskControlMiddleware(AgentMiddleware):
     ) -> str:
         """管理异步子代理任务。"""
         logger.info(f"收到子代理管控操作: action={action}")
-        if action in {"start", "run"}:
+        if action in {"start", "run", "pipeline"}:
             specs, error = self._normalize_specs(
                 description=description,
                 subagent_type=subagent_type,
@@ -895,6 +939,20 @@ class SubAgentTaskControlMiddleware(AgentMiddleware):
                 return self._json_response({"success": False, "error": error})
 
             logger.info(f"准备启动子代理任务: action={action}, tasks={len(specs)}")
+            if action == "pipeline":
+                records, pipeline_error = await self._run_pipeline(
+                    specs=specs,
+                    timeout_ms=timeout_ms,
+                )
+                return self._json_response(
+                    {
+                        "success": pipeline_error is None,
+                        "action": action,
+                        "error": pipeline_error,
+                        "tasks": [self._task_output(record) for record in records],
+                    }
+                )
+
             records = self._start_tasks(specs)
             if action == "run":
                 await self._wait_records(
@@ -1055,6 +1113,8 @@ def create_subagent_middlewares(
     stream_handler: Any = None,
 ) -> tuple[list[AgentMiddleware], list[BaseTool]]:
     """创建子代理中间件列表和任务工具列表。"""
+    _builtin_subagent_profiles.cache_clear()
+    builtin_subagent_names.cache_clear()
     profiles = _builtin_subagent_profiles()
     subagent_middleware = _try_create_deepagents_middleware(
         profiles=profiles,

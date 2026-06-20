@@ -4,7 +4,7 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.llm.capability import AgentCapabilityManager
-from app.agent.tools.base import MoviePilotTool, ToolChain
+from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
 from app.core.config import settings
 from app.log import logger
@@ -44,7 +44,6 @@ class SendVoiceMessageTool(MoviePilotTool):
         "or call `send_message` with the same content."
     )
     args_schema: Type[BaseModel] = SendVoiceMessageInput
-    require_admin: bool = False
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         """生成语音回复工具的执行提示。"""
@@ -87,7 +86,7 @@ class SendVoiceMessageTool(MoviePilotTool):
             f"use_voice={used_voice}, text_len={len(message)}"
         )
 
-        await ToolChain().async_post_message(
+        await self.send_notification_message(
             Notification(
                 channel=self._channel,
                 source=self._source,

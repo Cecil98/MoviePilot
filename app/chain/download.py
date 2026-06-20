@@ -22,7 +22,7 @@ from app.helper.directory import DirectoryHelper
 from app.helper.thread import ThreadHelper
 from app.helper.torrent import TorrentHelper
 from app.log import logger
-from app.schemas import ExistMediaInfo, FileURI, NotExistMediaInfo, DownloadingTorrent, Notification, ResourceSelectionEventData, \
+from app.schemas import ExistMediaInfo, FileURI, NotExistMediaInfo, DownloaderTorrent, Notification, ResourceSelectionEventData, \
     ResourceDownloadEventData
 from app.schemas.types import MediaType, TorrentStatus, EventType, MessageChannel, NotificationType, ContentType, \
     ChainEventType
@@ -1337,7 +1337,8 @@ class DownloadChain(ChainBase):
                 mtype=NotificationType.Download,
                 title="没有正在下载的任务！",
                 userid=userid,
-                link=settings.MP_DOMAIN('#/downloading')
+                link=settings.MP_DOMAIN('#/downloading'),
+                save_history=False,
             ))
             return
         # 发送消息
@@ -1356,10 +1357,11 @@ class DownloadChain(ChainBase):
             title=title,
             text="\n".join(messages),
             userid=userid,
-            link=settings.MP_DOMAIN('#/downloading')
+            link=settings.MP_DOMAIN('#/downloading'),
+            save_history=False,
         ))
 
-    def downloading(self, name: Optional[str] = None) -> List[DownloadingTorrent]:
+    def downloading(self, name: Optional[str] = None) -> List[DownloaderTorrent]:
         """
         查询正在下载的任务
         """
@@ -1417,7 +1419,7 @@ class DownloadChain(ChainBase):
             return
         logger.warn(f"检测到下载源文件被删除，删除下载任务（不含文件）：{hash_str}")
         # 先查询种子
-        torrents: List[schemas.TransferTorrent] = self.list_torrents(hashs=[hash_str])
+        torrents: List[schemas.DownloaderTorrent] = self.list_torrents(hashs=[hash_str])
         if torrents:
             self.remove_torrents(hashs=[hash_str], delete_file=False)
             # 发出下载任务删除事件，如需处理辅种，可监听该事件

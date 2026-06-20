@@ -28,9 +28,8 @@ from app.log import logger
 from app.schemas import (
     RateLimitExceededException,
     TransferInfo,
-    TransferTorrent,
     ExistMediaInfo,
-    DownloadingTorrent,
+    DownloaderTorrent,
     CommingMessage,
     Notification,
     WebhookEventInfo,
@@ -205,6 +204,13 @@ class ChainBase(metaclass=ABCMeta):
             dispatch_message.userid
         )
         return dispatch_message
+
+    @staticmethod
+    def _build_notice_message_data(message: Notification) -> dict:
+        """
+        构造消息通知事件数据。
+        """
+        return {**message.model_dump(exclude={"save_history"}), "type": message.mtype}
 
     async def async_remove_cache(self, filename: str) -> None:
         """
@@ -1221,16 +1227,22 @@ class ChainBase(metaclass=ABCMeta):
             status: TorrentStatus = None,
             hashs: Union[list, str] = None,
             downloader: Optional[str] = None,
-    ) -> Optional[List[Union[TransferTorrent, DownloadingTorrent]]]:
+            include_all_tags: bool = False,
+    ) -> Optional[List[DownloaderTorrent]]:
         """
         获取下载器种子列表
         :param status:  种子状态
         :param hashs:  种子Hash
         :param downloader:  下载器
+        :param include_all_tags:  是否包含未打内置标签的下载任务
         :return: 下载器中符合状态的种子列表
         """
         return self.run_module(
-            "list_torrents", status=status, hashs=hashs, downloader=downloader
+            "list_torrents",
+            status=status,
+            hashs=hashs,
+            downloader=downloader,
+            include_all_tags=include_all_tags,
         )
 
     def transfer(
@@ -1348,6 +1360,61 @@ class ChainBase(metaclass=ABCMeta):
         """
         return self.run_module("set_torrents_tag", hashs=hashs, tags=tags, downloader=downloader)
 
+    def update_torrent(
+            self,
+            hash_string: str,
+            downloader: Optional[str] = None,
+            download_limit: Optional[float] = None,
+            upload_limit: Optional[float] = None,
+            tracker_list: Optional[list] = None,
+            save_path: Optional[str] = None,
+            category: Optional[str] = None,
+            ratio_limit: Optional[float] = None,
+            seeding_time_limit: Optional[int] = None,
+    ) -> Optional[Dict[str, bool]]:
+        """
+        修改下载任务属性。
+        :param hash_string: 种子Hash
+        :param downloader: 下载器
+        :param download_limit: 下载限速，单位 KB/s
+        :param upload_limit: 上传限速，单位 KB/s
+        :param tracker_list: Tracker URL列表
+        :param save_path: 保存目录
+        :param category: 分类
+        :param ratio_limit: 分享率限制
+        :param seeding_time_limit: 做种时间限制，单位分钟
+        :return: 各项修改结果
+        """
+        return self.run_module(
+            "update_torrent",
+            hash_string=hash_string,
+            downloader=downloader,
+            download_limit=download_limit,
+            upload_limit=upload_limit,
+            tracker_list=tracker_list,
+            save_path=save_path,
+            category=category,
+            ratio_limit=ratio_limit,
+            seeding_time_limit=seeding_time_limit,
+        )
+
+    def get_torrent_trackers(
+            self,
+            hash_string: str,
+            downloader: Optional[str] = None,
+    ) -> Optional[Dict[str, List[str]]]:
+        """
+        查询下载任务Tracker列表。
+        :param hash_string: 种子Hash
+        :param downloader: 下载器
+        :return: 下载器名称到Tracker列表的映射
+        """
+        return self.run_module(
+            "get_torrent_trackers",
+            hash_string=hash_string,
+            downloader=downloader,
+        )
+
     def torrent_files(
             self, tid: str, downloader: Optional[str] = None
     ) -> Optional[Union[TorrentFilesList, List[File]]]:
@@ -1418,9 +1485,8 @@ class ChainBase(metaclass=ABCMeta):
         if not message:
             logger.warning("消息为空，跳过发送")
             return
-        # 保存消息
-        self.messagehelper.put(message, role="user", title=message.title)
-        self.messageoper.add(**message.model_dump())
+        if message.save_history:
+            self.messageoper.add(**message.model_dump())
         dispatch_message = self._normalize_notification_for_dispatch(message)
         # 发送消息按设置隔离
         if not dispatch_message.userid and dispatch_message.mtype:
@@ -1481,7 +1547,7 @@ class ChainBase(metaclass=ABCMeta):
                     # 按设定发送
                     self.eventmanager.send_event(
                         etype=EventType.NoticeMessage,
-                        data={**send_message.model_dump(), "type": send_message.mtype},
+                        data=self._build_notice_message_data(send_message),
                     )
                     self.messagequeue.send_message(
                         "post_message", message=send_message, **kwargs
@@ -1491,7 +1557,7 @@ class ChainBase(metaclass=ABCMeta):
         # 发送消息事件
         self.eventmanager.send_event(
             etype=EventType.NoticeMessage,
-            data={**dispatch_message.model_dump(), "type": dispatch_message.mtype},
+            data=self._build_notice_message_data(dispatch_message),
         )
         # 按原消息发送
         self.messagequeue.send_message(
@@ -1535,9 +1601,8 @@ class ChainBase(metaclass=ABCMeta):
         if not message:
             logger.warning("消息为空，跳过发送")
             return
-        # 保存消息
-        self.messagehelper.put(message, role="user", title=message.title)
-        await self.messageoper.async_add(**message.model_dump())
+        if message.save_history:
+            await self.messageoper.async_add(**message.model_dump())
         dispatch_message = self._normalize_notification_for_dispatch(message)
         # 发送消息按设置隔离
         if not dispatch_message.userid and dispatch_message.mtype:
@@ -1598,7 +1663,7 @@ class ChainBase(metaclass=ABCMeta):
                     # 按设定发送
                     await self.eventmanager.async_send_event(
                         etype=EventType.NoticeMessage,
-                        data={**send_message.model_dump(), "type": send_message.mtype},
+                        data=self._build_notice_message_data(send_message),
                     )
                     await self.messagequeue.async_send_message(
                         "post_message", message=send_message, **kwargs
@@ -1608,7 +1673,7 @@ class ChainBase(metaclass=ABCMeta):
         # 发送消息事件
         await self.eventmanager.async_send_event(
             etype=EventType.NoticeMessage,
-            data={**dispatch_message.model_dump(), "type": dispatch_message.mtype},
+            data=self._build_notice_message_data(dispatch_message),
         )
         # 按原消息发送
         await self.messagequeue.async_send_message(
@@ -1628,10 +1693,8 @@ class ChainBase(metaclass=ABCMeta):
         :return: 成功或失败
         """
         note_list = [media.to_dict() for media in medias]
-        self.messagehelper.put(
-            message, role="user", note=note_list, title=message.title
-        )
-        self.messageoper.add(**message.model_dump(), note=note_list)
+        if message.save_history:
+            self.messageoper.add(**message.model_dump(), note=note_list)
         dispatch_message = self._normalize_notification_for_dispatch(message)
         return self.messagequeue.send_message(
             "post_medias_message",
@@ -1650,10 +1713,8 @@ class ChainBase(metaclass=ABCMeta):
         :return: 成功或失败
         """
         note_list = [torrent.torrent_info.to_dict() for torrent in torrents]
-        self.messagehelper.put(
-            message, role="user", note=note_list, title=message.title
-        )
-        self.messageoper.add(**message.model_dump(), note=note_list)
+        if message.save_history:
+            self.messageoper.add(**message.model_dump(), note=note_list)
         dispatch_message = self._normalize_notification_for_dispatch(message)
         return self.messagequeue.send_message(
             "post_torrents_message",

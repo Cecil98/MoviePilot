@@ -4,7 +4,7 @@ from typing import List, Optional, Type
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.agent.tools.base import MoviePilotTool, ToolChain
+from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
 from app.helper.interaction import (
     AgentInteractionOption,
@@ -83,7 +83,6 @@ class AskUserChoiceTool(MoviePilotTool):
         "back as the user's next message. Do not also send the same question as plain text."
     )
     args_schema: Type[BaseModel] = AskUserChoiceInput
-    require_admin: bool = False
 
     def get_tool_message(self, **kwargs) -> Optional[str]:
         message = kwargs.get("message", "") or ""
@@ -189,7 +188,7 @@ class AskUserChoiceTool(MoviePilotTool):
             len(choice_options),
         )
 
-        await ToolChain().async_post_message(
+        await self.send_notification_message(
             Notification(
                 channel=channel,
                 source=self._source,

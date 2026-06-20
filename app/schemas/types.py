@@ -43,6 +43,22 @@ class TorrentStatus(Enum):
     DOWNLOADING = "下载中"
 
 
+# 下载器任务查询状态
+class TorrentQueryStatus(Enum):
+    ALL = "all"
+    TRANSFER = "transfer"
+    DOWNLOADING = "downloading"
+    COMPLETED = "completed"
+    PAUSED = "paused"
+
+
+# 下载器任务归一状态
+class DownloadTaskState(Enum):
+    DOWNLOADING = "downloading"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+
 # 异步广播事件
 class EventType(Enum):
     # 插件需要重载
@@ -147,6 +163,8 @@ EVENT_TYPE_NAMES = {
 
 # 同步链式事件
 class ChainEventType(Enum):
+    # 插件数据重置前
+    PluginDataReset = "plugin.data.reset"
     # 名称识别
     NameRecognize = "name.recognize"
     # 认证验证
@@ -326,6 +344,7 @@ class MessageChannel(Enum):
     SynologyChat = "SynologyChat"
     VoceChat = "VoceChat"
     Web = "Web"
+    WebAgent = "WebAgent"
     WebPush = "WebPush"
     QQ = "QQ"
 
